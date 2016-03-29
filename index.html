@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html>
+    <head>
+        <title>Perlin Playground</title>
+    </head>
+    <body>
+        <script>
+        function toCanvas(grid) {
+            var canvas = document.createElement('canvas');
+            var width = canvas.width = grid[0].length;
+            var height = canvas.height = grid.length;
+
+            var min = grid[0][0], max = min + 1e-20;
+            grid.forEach(function (row) {
+                row.forEach(function (value) {
+                    min = Math.min(min, value);
+                    max = Math.max(max, value);
+                });
+            });
+
+            var context = canvas.getContext('2d');
+            var imageData = context.createImageData(width, height);
+            var pixelData = imageData.data;
+            for (var y = 0; y < height; y++) {
+                for (var x = 0; x < width; x++) {
+                    var index = (y*width + x)*4;
+                    var value = grid[y][x];
+                    value = Math.round(255*(value - min)/(max - min));
+                    pixelData[index + 0] = value;
+                    pixelData[index + 1] = value;
+                    pixelData[index + 2] = value;
+                    pixelData[index + 3] = 255;
+                }
+            }
+            context.putImageData(imageData, 0, 0);
+            return canvas;
+        }
+
+        function create(width, height, valueFn) {
+            var pixels = [];
+            while (pixels.length < height) {
+                var y = pixels.length;
+                var row = [];
+                while (row.length < width) {
+                    var x = row.length;
+                    row.push(valueFn(x, y));
+                }
+                pixels.push(row);
+            }
+            return pixels;
+        }
+
+        var width = 200, height = 100;
+        var phase = create(width, height, function (x, y) {
+            return Math.random()*2*Math.PI;
+        });
+        function createSpectrum(width, height, ampFn) {
+            var amps = create(width, height, function ())
+        };
+
+        document.body.appendChild(toCanvas(phase));
+        </script>
+    </body>
+</html>
