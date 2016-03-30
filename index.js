@@ -1,6 +1,8 @@
 var inputWav = process.argv[2];
 var frameDir = process.argv[3] || 'frames';
 var frameRate = parseFloat(process.argv[4]) || 30;
+var width = parseFloat(process.argv[5]) || 1280;
+var height = parseFloat(process.argv[6]) || 720;
 
 var path = require('path');
 var fse = require('fs-extra');
@@ -52,6 +54,25 @@ function threshhold(noise, value, darknessValue) {
         return 255 - Math.min(255, pixel*255/darknessValue);
     })
 }
+function threshholdProportion(noise, targetProportion) {
+    var values = [];
+    for (var x = 0; x < noise.shape[0]; x++) {
+        for (var y = 0; y < noise.shape[1]; y++) {
+            values.push(noise.get(x, y));
+        }
+    }
+    values.sort(function (a, b) {
+        return a - b;
+    });
+
+    var valueIndex = Math.floor(targetProportion*values.length);
+    var value = values[valueIndex];
+    return generate(noise.shape[0], noise.shape[1], function (x, y) {
+        var pixel = noise.get(x, y);
+        if (pixel >= value) return 255;
+        return 0;
+    });
+}
 
 function std(data) {
     var sum = 0, sum2 = 0, total = 0;
@@ -95,11 +116,6 @@ function writePng(data, pngFile, callback) {
         callback(error);
     });
 }
-var width = 1280, height = 720;
-/*
-width /= 5;
-height /= 5;
-//*/
 
 var phaseStart = generate(width, height, function (x, y) {
     return Math.random()*2*Math.PI;
@@ -125,11 +141,15 @@ var baseFreq = 40;
 var threshholdAmp = 0, threshholdAmpDarkness = 0.001;
 //var threshholdAmp = -1, threshholdAmpDarkness = 2;
 var threshholdAmpFactor = 0, threshholdDarknessFactor = 0.01;
-var timeOffset = 0.01;
+var timeOffset = 0.015;
 function freqMultiplier(freq) {
     if (freq < 80) return freq/80;
     //if (freq > 4000) return 1 + freq/4000)/2;
     return 1;
+}
+var ampMultiplier = 0.4, ampPower = 0.5;
+function proportionCurve(v) {
+    return 1 - Math.exp(-Math.pow(v, ampPower)*ampMultiplier);
 }
 
 ndarrayWav.open(inputWav, function (error, chunks) {
@@ -137,6 +157,8 @@ ndarrayWav.open(inputWav, function (error, chunks) {
     var format = chunks.fmt;
     var sampleRate = format.sampleRate;
     var waveform = chunks.data;
+
+    var waveformStd = std(waveform);
 
     var durationSeconds = waveform.shape[1]/sampleRate;
     var frameTimes = [];
@@ -159,58 +181,100 @@ ndarrayWav.open(inputWav, function (error, chunks) {
         frameFile = path.join(frameDir, 'frame' + frameFile + '.png');
 
         var frameTime = frameTimes.shift();
-        var framePreTime = Math.max(1/frameRate, 0.1);
-        var framePostTime = Math.max(1/frameRate, 0.03);
-        var extractMidSample = frameTime*sampleRate;
-        var extractStartSample = Math.round((frameTime - framePreTime)*sampleRate);
-        var extractEndSample = Math.round((frameTime + framePostTime)*sampleRate);
+        function getSpectrum(width) {
+            var extractMidSample = frameTime*sampleRate - width*0.1;
+            var framePreTime = Math.max(1/frameRate, width*0.7);
+            var framePostTime = Math.max(1/frameRate, width*0.3);
+            var extractStartSample = Math.round(extractMidSample - framePreTime*sampleRate);
+            var extractEndSample = Math.round(extractMidSample + framePostTime*sampleRate);
 
-        var fftSize = 256;
-        while (fftSize < (extractEndSample - extractStartSample) || fftSize < width || fftSize < height) {
-            fftSize *= 2;
+            var fftSize = 256;
+            while (fftSize < (extractEndSample - extractStartSample) || fftSize < width || fftSize < height) {
+                fftSize *= 2;
+            }
+            fftSize *= 2;   // Padding
+            var extract = generate(2, fftSize, function (channel, index) {
+                var sampleIndex = index + extractStartSample;
+                if (sampleIndex < 0) {
+                    return 0;
+                }
+                if (sampleIndex >= extractEndSample || sampleIndex >= waveform.shape[1]) {
+                    return 0;
+                }
+                var value = waveform.get(channel, sampleIndex);
+                var offsetSample = sampleIndex - extractMidSample;
+                var windowValue = 1;
+                if (offsetSample < 0) {
+                    // Pre-window
+                    var windowRatio = -offsetSample/(extractMidSample - extractStartSample);
+                    windowValue = 1 + Math.cos(windowRatio*Math.PI);
+                } else {
+                    // Post-window
+                    var windowRatio = offsetSample/(extractEndSample - extractMidSample);
+                    windowValue = 1 + Math.cos(windowRatio*Math.PI);
+                }
+                return value*windowValue;
+            });
+            ndarrayFft(1, extract.pick(0), extract.pick(1));
+
+            return function ampFunction(distance) {
+                var freq = distance*baseFreq;
+                var index = Math.round(freq/sampleRate*fftSize);
+                if (index >= fftSize/2 || index < 1) return 0;
+                var index2 = fftSize - index;
+                var leftReal = (extract.pick(0, index) + extract.pick(0, index2))/2;
+                var leftImag = (extract.pick(1, index) - extract.pick(1, index2))/2;
+                var rightReal = (extract.pick(1, index) + extract.pick(1, index2))/2;
+                var rightImag = (-extract.pick(0, index) + extract.pick(0, index2))/2;
+
+                var leftMag2 = leftReal*leftReal + leftImag*leftImag;
+                var rightMag2 = rightReal*rightReal + rightImag*rightImag;
+                var mag = Math.sqrt((leftMag2 + rightMag2)/2);
+                return mag/fftSize*freqMultiplier(freq);
+            };
         }
-        var extractAmp2 = 0;
-        var extract = generate(2, fftSize, function (channel, index) {
-            var sampleIndex = index + extractStartSample;
-            if (sampleIndex < 0) {
-                return 0;
-            }
-            if (sampleIndex >= extractEndSample || sampleIndex >= waveform.shape[1]) {
-                return 0;
-            }
-            var value = waveform.get(channel, sampleIndex);
-            var offsetSample = sampleIndex - extractMidSample;
-            var windowValue = 1;
-            if (offsetSample < 0) {
-                // Pre-window
-                var windowRatio = -offsetSample/(extractMidSample - extractStartSample);
-                windowValue = 1 + Math.cos(windowRatio*Math.PI);
-            } else {
-                // Post-window
-                var windowRatio = offsetSample/(extractEndSample - extractMidSample);
-                windowValue = 1 + Math.cos(windowRatio*Math.PI);
-            }
-            extractAmp2 += value*value*windowValue;
-            return value*windowValue;
-        });
-        var extractAmp = Math.sqrt(extractAmp2/(extractEndSample - extractStartSample));
-        ndarrayFft(1, extract.pick(0), extract.pick(1));
 
-        function ampFunction(distance) {
-            var freq = distance*baseFreq;
-            var index = Math.round(freq/sampleRate*fftSize);
-            if (index >= fftSize/2) return 0;
-            var index2 = fftSize - index;
-            var leftReal = (extract.pick(0, index) + extract.pick(0, index2))/2;
-            var leftImag = (extract.pick(1, index) - extract.pick(1, index2))/2;
-            var rightReal = (extract.pick(1, index) + extract.pick(1, index2))/2;
-            var rightImag = (-extract.pick(0, index) + extract.pick(0, index2))/2;
-
-            var leftMag2 = leftReal*leftReal + leftImag*leftImag;
-            var rightMag2 = rightReal*rightReal + rightImag*rightImag;
-            var mag = Math.sqrt((leftMag2 + rightMag2)/2);
-            return mag/fftSize*freqMultiplier(freq);
+        /*
+        // Use different widths of window for different frequencies
+        var ampFunctions = {}, minCycles = 10;
+        var minDuration = 0.015, maxDuration = 0.05;
+        var ampFunction = function (distance) {
+            var freq = Math.max(baseFreq, distance*baseFreq);
+            var freqWidth = minCycles/freq;
+            var spectrumWidth = Math.max(2/frameRate, minDuration);
+            var prevSpectrumWidth = spectrumWidth;
+            while (spectrumWidth < freqWidth && spectrumWidth < maxDuration) {
+                prevSpectrumWidth = spectrumWidth;
+                spectrumWidth *= 2;
+            }
+            spectrumWidth = Math.min(maxDuration, spectrumWidth);
+            prevSpectrumWidth = Math.min(maxDuration, prevSpectrumWidth);
+            if (!ampFunctions[spectrumWidth]) {
+                ampFunctions[spectrumWidth] = getSpectrum(spectrumWidth);
+            }
+            if (!ampFunctions[prevSpectrumWidth]) {
+                ampFunctions[prevSpectrumWidth] = getSpectrum(prevSpectrumWidth);
+            }
+            if (spectrumWidth === prevSpectrumWidth) {
+                return ampFunctions[spectrumWidth](distance);
+            }
+            // Linearly interpolate between spectra of different lengths
+            var ratio = (freqWidth - prevSpectrumWidth)/(spectrumWidth - prevSpectrumWidth);
+            ratio = Math.max(0, Math.min(1, ratio));
+            return ampFunctions[prevSpectrumWidth](distance)*(1 - ratio)
+                + ampFunctions[spectrumWidth](distance)*ratio;
         }
+        /*/
+
+        // Override - single duration for all elements
+        var ampFunction = getSpectrum(0.1);
+        //*/
+
+        var extractAmp2 = 0, extractAmpStep = 0.1;
+        for (var dist = 0; dist < Math.sqrt(width*height); dist += extractAmpStep) {
+            extractAmp2 += ampFunction(dist)*extractAmpStep;
+        }
+        var extractAmp = Math.sqrt(extractAmp2);
 
         var phase = generate(width, height, function (x, y) {
             return phaseStart.get(x, y) + frameTime*phaseRates.get(x, y);
@@ -218,7 +282,8 @@ ndarrayWav.open(inputWav, function (error, chunks) {
         var noise = generateNoise(phase, function (distance) {
             return ampFunction(distance);
         });
-        var pattern = threshhold(noise, threshholdAmp + extractAmp*threshholdAmpFactor, threshholdAmpDarkness + extractAmp*threshholdDarknessFactor);
+        var pattern = threshholdProportion(noise, proportionCurve(extractAmp/waveformStd));
+        //var pattern = threshhold(noise, threshholdAmp + extractAmp*threshholdAmpFactor, threshholdAmpDarkness + extractAmp*threshholdDarknessFactor);
         writePng(pattern, frameFile, function (error) {
             if (error) throw error;
             var ratio = frameIndexCounter/frameIndexTotal;
