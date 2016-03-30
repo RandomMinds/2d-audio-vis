@@ -3,6 +3,7 @@ var frameDir = process.argv[3] || 'frames';
 var frameRate = parseFloat(process.argv[4]) || 30;
 var widthOrImage = process.argv[5];
 var heightArg = process.argv[6];
+var waveformRefStd = parseFloat(process.argv[7]) || 0;
 var width, height;
 
 var path = require('path');
@@ -83,6 +84,7 @@ function freqMultiplier(freq) {
     return 1;
 }
 var ampMultiplier = 0.4, ampPower = 0.5;
+var ampMultiplier = 1, ampPower = 0.5;
 function proportionCurve(v) {
     return 1 - Math.exp(-Math.pow(v, ampPower)*ampMultiplier);
 }
@@ -109,6 +111,8 @@ getBackgroundImage(function (error, background) {
         var waveform = chunks.data;
 
         var waveformStd = common.std(waveform);
+        console.log('waveform s.d.:', waveformStd);
+        waveformStd = waveformRefStd || waveformStd;
 
         var durationSeconds = waveform.shape[1]/sampleRate;
         var frameTimes = [];
