@@ -1,0 +1,30 @@
+{
+	"fuzzy": 1,
+	"independent": true,
+	"combine": "light",
+	"rgb": [0, 0, 0],
+	"layers": [
+		{
+			"wav": "02 - - 01 - - Warble Pluck.wav",
+			"rgb": [128, 192, 255]
+		},
+		{
+			"wav": "03 - - 04 - - Warble Pad.wav",
+			"rgb": [128, 192, 255],
+			"fuzzy": 2
+		},
+		{
+			"wav": "04 - - 06 - - Piano (Play).wav",
+			"rgb": [192, 128, 64],
+			"fuzzy": 0.5
+		},
+		{
+			"wav": "05 - - 08 - - Black Drums.wav",
+			"rgb": [128, 128, 128]
+		},
+		{
+			"wav": "06 - - 10 - - Synth Bass.wav",
+			"rgb": [255, 64, 64]
+		}
+	]
+}
