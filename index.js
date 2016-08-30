@@ -1,3 +1,5 @@
+"use strict";
+
 var fse = require('fs-extra');
 var path = require('path');
 var crypto = require('crypto');
@@ -15,22 +17,24 @@ function tanh(x) {
 	return Math.tanh(x);
 }
 
+var phaseCached = {};
 function Perlin(seed, options) {
 	var thisPerlin = this;
 	this._seed = seed;
 	this._options = options || {};
 	
 	var width = this._width = options.width || 320;
-	var height = this._height = options.height || Math.round(width/4*3/16)*16;
+	var height = this._height = options.height || Math.round(width/16*9/16)*16;
 	
 	var freqBase = this._freqBase = options.freqBase || 40;
-	var phaseBase = this._phaseBase = this._create(width, height, function (x, y) {
+	var cached = phaseCached[seed] = phaseCached[seed] || {};
+	var phaseBase = this._phaseBase = cached.base = cached.base || this._create(width, height, function (x, y) {
 		var dx = (x > width/2) ? x - width : x;
 		var dy = (y > height/2) ? y - height : y;
 		var random = thisPerlin._random(dx + '_' + dy + '_phaseBase');
 		return random*Math.PI*2;
 	});
-	var phaseRate = this._phaseRate = this._create(width, height, function (x, y) {
+	var phaseRate = this._phaseRate = cached.rate = cached.rate || this._create(width, height, function (x, y) {
 		var dx = (x > width/2) ? x - width : x;
 		var dy = (y > height/2) ? y - height : y;
 		var random = thisPerlin._random(dx + '_' + dy + '_phaseRate');
@@ -62,17 +66,31 @@ Perlin.prototype = {
 		if (density <= 0 || density >= 1) return this._create(width, height, function (x, y) {
 			return density > 0 ? 1 : 0;
 		});
+		function spaceFactor(dist) {
+			if (!dist) return 0;
+			var shortEdge = Math.min(width, height)/2, longEdge = Math.max(width, height)/2;
+			var startAngle = (dist <= shortEdge) ? 0 : Math.acos(shortEdge/dist);
+			var endAngle = (dist <= longEdge) ? Math.PI/2 : Math.asin(longEdge/dist);
+			if (endAngle < startAngle || endAngle > startAngle + Math.PI/2) {
+				console.log(dist, shortEdge, longEdge);
+				throw new Error('geometry failure');
+			}
+			return 1/dist/(endAngle - startAngle);
+		}
 
 		var freqBase = this._freqBase;
 		var phaseBase = this._phaseBase, phaseRate = this._phaseRate;
 		var spectrumReal = this._create(), spectrumImag = this._create();
+		var midSide = Math.sqrt(width*height);
 		for (var x = 0; x < width; x++) {
 			for (var y = 0; y < height; y++) {
 				var dx = (x > width/2) ? x - width : x;
 				var dy = (y > height/2) ? y - height : y;
+				dx *= midSide/width;
+				dy *= midSide/height;
 				var dist = Math.sqrt(dx*dx + dy*dy);
 				var freq = freqBase*dist;
-				var amp = ampFn(freq);
+				var amp = ampFn(freq)*spaceFactor(dist);
 				var phase = phaseBase.get(x, y) + time*phaseRate.get(x, y);
 				spectrumReal.set(x, y, amp*Math.cos(phase));
 				spectrumImag.set(x, y, amp*Math.sin(phase));
@@ -95,8 +113,13 @@ Perlin.prototype = {
 		
 		var threshhold = jstat.normal.inv(density, 0, std);
 		var fuzzyWidth = (this._options.fuzzy || 0)*std;
+		var vignetteOffset = this._options.vignette*std, vignetteDistance2 = width*height/4, vignetteSharpness = this._options.vignetteSharpness;
+		var vignetteMidpoint = vignetteOffset*Math.pow(0.25, vignetteSharpness);
+		threshhold += vignetteMidpoint;
 		return this._create(width, height, function (x, y) {
-			var relative = spectrumReal.get(x, y) + threshhold;
+			var dx = x - width/2, dy = y - height/2;
+			var centreDist2 = dx*dx + dy*dy;
+			var relative = spectrumReal.get(x, y) + threshhold - vignetteOffset*Math.pow(centreDist2/vignetteDistance2, vignetteSharpness);
 			if (!fuzzyWidth) return (relative > 0) ? 1 : 0;
 			var value = tanh(relative/fuzzyWidth)*0.5 + 0.5;
 			return value;
@@ -105,18 +128,20 @@ Perlin.prototype = {
 };
 
 function rgbStack(stack, options) {
-	startrgb = options.rgb || [255, 255, 255];
+	var defaultColour = [255, 255, 255];
 	var combineFunction = function (current, target, amount) {
 		// Multiplicative
 		var factor = 1 + (target - 255)/255*amount;
 		return current*factor;
 	};
 	if (options.combine === 'light') {
+		defaultColour = [0, 0, 0];
 		var darkCombine = combineFunction;
 		combineFunction = function (current, target, amount) {
 			return 255 - darkCombine(255 - current, 255 - target, amount);
 		};
 	}
+	var startrgb = options.rgb || defaultColour;
 	
 	var width = stack[0].noise.shape[0], height = stack[0].noise.shape[1];
 	var array = new Array(3*width*height);
@@ -136,27 +161,50 @@ function rgbStack(stack, options) {
 	return rgb;
 }
 
+function createBackground(entry, perlin, backgroundOptions, callback) {
+	callback(null, {
+		duration: entry.duration || 1,
+		noise: function (time, duration) {
+			var percentile = 0.5*backgroundOptions.gain;
+			if (backgroundOptions.fadeIn && time < backgroundOptions.fadeIn) percentile *= Math.max(0, time)/backgroundOptions.fadeIn;
+			if (backgroundOptions.fadeOut) {
+				var remaining = duration - time;
+				if (remaining < backgroundOptions.fadeOut) percentile *= Math.max(0, remaining)/backgroundOptions.fadeOut;
+			}
+			return perlin.noise(time, function (f) {
+				if (!f) return 0;
+				var lowCut = (f < backgroundOptions.lowFreq) ? f/backgroundOptions.lowFreq : 1;
+				return 1*Math.pow(f, backgroundOptions.brighten)/f;
+			}, percentile);
+		}
+	});
+}
+
 function createVisualiser(wavFile, perlin, options, callback) {
-	var lowFreq = options.lowFreq || 100;
+	var lowFreq = options.lowFreq || 50;
+	var brightenFactor = options.brighten || 0;
+	var gain = options.gain || 1;
 	function freqMultiplier(freq) {
-		if (freq < lowFreq) return freq/lowFreq;
-		return 1;
+		var factor = (freq < lowFreq) ? freq/lowFreq : 1;
+		return factor*Math.pow(freq, brightenFactor);
 	}
 	function densityMap(rms) {
-		return rms*Math.sqrt(2);
-		return Math.min(1, rms*2);
+		return rms*Math.sqrt(2)*gain;
 	}
 
 	ndarrayWav.open(wavFile, function (error, chunks) {
 		if (error) return callback(error);
 		var format = chunks.fmt;
 		var waveform = chunks.data;
-		var windowDuration = 0.2, windowPadding = 2, windowBias = 3;
+		var windowDuration = options.window || 0.2, windowPadding = 2, windowBias = ('windowBias' in options) ? options.windowBias : 3;
 		var windowDurationSamples = windowDuration*format.sampleRate;
 		var windowSamples = windowDuration*windowPadding*format.sampleRate;
 		windowSamples = Math.pow(2, Math.ceil(Math.log2(windowDurationSamples)));
 		console.log('\tloaded: ' + path.basename(wavFile));
-		var windowOffset = -windowDuration*Math.pow(0.5, 1/windowBias); // Middle of the window
+		if (typeof process.send === 'function') {
+			process.send({frame: 0, logLine: '\tloaded: ' + path.basename(wavFile)});
+		}
+		var windowOffset = -windowDuration*Math.pow(0.5, 1/windowBias); // Peak of the window
 		
 		var extractL = ndarray(new Float64Array(windowSamples));
 		var extractR = ndarray(new Float64Array(windowSamples));
@@ -214,7 +262,7 @@ function createVisualiser(wavFile, perlin, options, callback) {
 }
 
 if (require.main === module) {
-	var updateLineTimeout, updateLineTimeoutMs = 30, nextUpdateText;
+	var updateLineTimeout, updateLineTimeoutMs = 100, nextUpdateText;
 	function updateLine(text, sync) {
 		nextUpdateText = text;
 		function actualUpdate() {
@@ -244,7 +292,7 @@ if (require.main === module) {
 		updateLine(logLine);
 		if (typeof process.send === 'function') {
 			process.send({
-				estimateMs: endEstimateMs,
+				frame: frame,
 				logLine: logLine
 			});
 		}
@@ -254,7 +302,12 @@ if (require.main === module) {
 	var configFile = process.argv[argIndex++];
 	var relativeDir = process.cwd();
 	var imageDir = process.argv[argIndex++];
-	var width = parseFloat(process.argv[argIndex++] || 320), height = parseFloat(process.argv[argIndex++]);
+	
+	var width = parseFloat(process.argv[argIndex++]), height = parseFloat(process.argv[argIndex++]);
+	if (!height && !width) width = 320;
+	if (height && !width) width = Math.round(height/9)*16;
+	if (!height) height = Math.round(width/16*9/16)*16;
+	
 	var frameRate = process.argv[argIndex++] || 30;
 	var skipSpec = process.argv[argIndex++] || '';
 	var skipParts = skipSpec.split('/').map(parseFloat);
@@ -266,10 +319,10 @@ if (require.main === module) {
 		
 		var latestMessages = [];
 		for (var i = 0; i < numChildren; i++) {
-			latestMessages.push({estimateMs: 0, logLine: 'Initialising'});
+			latestMessages.push({frame: Infinity, logLine: 'Spawned ' + numChildren + ' workers'});
 		}
 		var workers = latestMessages.map(function (message, index) {
-			var worker = child_process.fork('index.js', args.concat(i + '/' + numChildren), {silent: true, stdio: ['ignore', 'ignore', process.stderr]});
+			var worker = child_process.fork('index.js', args.concat(index + '/' + numChildren), {silent: true, stdio: ['ignore', 'ignore', process.stderr]});
 			worker.on('message', function (message) {
 				latestMessages[index] = message;
 				logLatest();
@@ -278,10 +331,10 @@ if (require.main === module) {
 		});
 		updateLine('Spawned ' + workers.length + ' workers');
 		function logLatest() {
-			var latestMs = 0, logLine = '';
+			var earliestFrame = Infinity, logLine = '';
 			latestMessages.forEach(function (message) {
-				if (message.estimateMs >= latestMs) {
-					latestMes = message.estimateMs;
+				if (message.frame <= earliestFrame) {
+					earliestFrame = message.frame;
 					logLine = message.logLine;
 				}
 			});
@@ -289,9 +342,12 @@ if (require.main === module) {
 		}
 		return;
 	}
+	if (typeof process.send === 'function') {
+		process.send({frame: -1, logLine: 'Initialising'});
+	}
 	
 	if (!configFile || !imageDir) {
-		console.error('Usage:\n\tnode index <input.wav|input.json> <folder/> <?width=320> <?height> <?framerate>\n');
+		console.error('Usage:\n\tnode index <input.wav|input.json> <folder/> <?width=320> <?height> <?framerate> <?workers>\n');
 		process.exit(1);
 	}
 	fse.ensureDirSync(imageDir);
@@ -311,27 +367,32 @@ if (require.main === module) {
 		};
 	}
 
-	var perlinSeed = 'seed';
+	var perlinSeed = config.seed || 'seed';
 	var sharedPerlin;
 	var layerCount = 0;
+	var startEncodeMs = Date.now();
 	async.map(config.layers, function (spec, callback) {
 		var layerIndex = layerCount++;
-		var options = {width: width, height: height, fuzzy: 0};
-		if ('fuzzy' in config) options.fuzzy = config.fuzzy;
-		if ('fuzzy' in spec) options.fuzzy = spec.fuzzy;
+		var options = {width: width, height: height, window: 0.15, windowBias: 3, fuzzy: 0.5, lowFreq: 50, brighten: 0.5, gain: 1, vignette: 1, vignetteSharpness: 0.5, fadeIn: 0, fadeOut: 0};
+		for (var key in config) options[key] = config[key];
+		if (!spec.wav) options.fuzzy = 3;
+		for (var key in spec) options[key] = spec[key];
 
-		var seed = perlinSeed + (config.independent ? layerIndex : '');
-		var wavFile = path.resolve(relativeDir, spec.wav);
-		createVisualiser(wavFile, new Perlin(seed, options), options, callback);
+		var seed = perlinSeed + (config.independent ? layerIndex : '') + (spec.group || '');
+		if (spec.wav) {
+			var wavFile = path.resolve(relativeDir, spec.wav);
+			createVisualiser(wavFile, new Perlin(seed, options), options, callback);
+		} else {
+			createBackground(spec, new Perlin(seed, options), options, callback);
+		}
 	}, function (error, visList) {
 		if (error) throw error;
 
 		var duration = visList[0].duration;
 		for (var i = 0; i < visList.length; i++) duration = Math.max(duration, visList[i].duration);
 
-		var startEncodeMs = Date.now();
 		function drawFrame(frameN) {
-			var time = (frameN + 0.5)/frameRate;
+			var time = (frameN - 0.5)/frameRate;
 			if (time >= duration) {
 				updateLine('');
 				return;
@@ -345,7 +406,7 @@ if (require.main === module) {
 			var stack = visList.map(function (vis, index) {
 				return {
 					rgb: config.layers[index].rgb || [0, 0, 0],
-					noise: vis.noise(time)
+					noise: vis.noise(time, duration)
 				};
 			});
 			var image = rgbStack(stack, config);
@@ -361,30 +422,6 @@ if (require.main === module) {
 				drawFrame(frameN + 1);
 			});
 		}
-		drawFrame(0);
+		drawFrame(1);
 	});
-	/*
-	var stack = [];
-	stack.push({
-		rgb: [64, 128, 192],
-		noise: perlin.noise(0, function (f) {
-			if (!f) return 0;
-			return 1/f;
-		}, 0.5)
-	});
-	stack.push({
-		rgb: [192, 128, 64],
-		noise: perlin.noise(1, function (f) {
-			if (!f) return 0;
-			return 1/f/f;
-		}, 0.5)
-	});
-	stack.push({
-		rgb: [0, 192, 0],
-		noise: perlin.noise(2, function (f) {
-			if (!f) return 0;
-			return 1/f/Math.sqrt(f);
-		}, 0.5)
-	});
-	*/
 }
